@@ -1,0 +1,273 @@
+#!/bin/bash
+set -e
+set -o pipefail
+exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+
+echo "=========================================================="
+echo "STARTING APPLICATION CONFIGURATION: $(date)"
+echo "=========================================================="
+
+# Secret ARN passed from Terraform
+SECRET_ARN="${db_secret_arn}"
+AWS_REGION="${AWS_REGION}"
+S3_BUCKET_NAME="${bucket_name}"
+PROFILE="${profile}"
+
+echo "Environment variables:"
+echo "AWS_REGION: $AWS_REGION"
+echo "S3_BUCKET_NAME: $S3_BUCKET_NAME"
+echo "PROFILE: $PROFILE"
+
+echo "=========================================================="
+echo "CHECKING AWS CLI INSTALLATION: $(date)"
+echo "=========================================================="
+
+# Check if AWS CLI is installed, install if not
+if ! command -v aws &> /dev/null; then
+    echo "AWS CLI not found, installing..."
+    
+    # Install required packages
+    sudo apt-get update
+    sudo apt-get install -y unzip curl
+    
+    # Download and install AWS CLI v2
+    curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
+    unzip -q /tmp/awscliv2.zip -d /tmp
+    sudo /tmp/aws/install
+    
+    # Clean up
+    rm -rf /tmp/aws /tmp/awscliv2.zip
+    
+    echo "AWS CLI installed successfully"
+    aws --version
+else
+    echo "AWS CLI is already installed"
+    aws --version
+fi
+
+echo "=========================================================="
+
+# Create log folders and files with proper permissions
+sudo mkdir -p /var/log/webapp
+sudo touch /var/log/webapp/application.log
+sudo chmod 666 /var/log/webapp/application.log
+
+echo "=========================================================="
+echo "Retrieving database credentials from Secrets Manager..."
+echo "=========================================================="
+
+# Install jq if not already installed
+if ! command -v jq &> /dev/null; then
+    sudo apt-get update
+    sudo apt-get install -y jq
+fi
+
+# Retrieve database credentials from Secrets Manager
+DB_SECRET=$(aws secretsmanager get-secret-value \
+  --secret-id "$SECRET_ARN" \
+  --region "$AWS_REGION" \
+  --query 'SecretString' \
+  --output text)
+
+# Parse the JSON to extract values
+DB_USERNAME=$(echo $DB_SECRET | jq -r '.username')
+DB_PASSWORD=$(echo $DB_SECRET | jq -r '.password')
+DB_NAME=$(echo $DB_SECRET | jq -r '.dbname')
+DB_HOSTNAME=$(echo $DB_SECRET | jq -r '.host')
+
+echo "Database credentials retrieved successfully"
+echo "DB_NAME: $DB_NAME"
+echo "DB_HOSTNAME: $DB_HOSTNAME"
+
+echo "=========================================================="
+echo "Creating application.properties file..."
+echo "=========================================================="
+
+# Create the application.properties with the correct values
+cat > /opt/webapp/application.properties << EOF
+spring.application.name=web-app
+
+# Server port configuration
+server.port=8080
+
+# Database Configuration
+spring.datasource.url=jdbc:postgresql://$DB_HOSTNAME:5432/$DB_NAME
+spring.datasource.username=$DB_USERNAME
+spring.datasource.password=$DB_PASSWORD
+spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.PostgreSQLDialect
+spring.datasource.driver-class-name=org.postgresql.Driver
+spring.jpa.hibernate.ddl-auto=update
+spring.jpa.show-sql=true
+spring.jpa.properties.hibernate.format_sql=true
+spring.datasource.hikari.maximum-pool-size=2
+spring.datasource.hikari.minimum-idle=1
+spring.datasource.hikari.connection-timeout=10000
+spring.datasource.hikari.idle-timeout=2000
+spring.jpa.open-in-view=false
+
+# AWS S3 Configuration
+aws.s3.bucket=${bucket_name}
+aws.region=${AWS_REGION}
+cloud.aws.s3.bucket=${bucket_name}
+cloud.aws.region.static=${AWS_REGION}
+
+# File upload settings
+spring.servlet.multipart.max-file-size=10MB
+spring.servlet.multipart.max-request-size=10MB
+app.max-file-size=10485760
+
+# StatsD Metrics Configuration
+management.metrics.export.statsd.enabled=true
+management.metrics.export.statsd.host=localhost
+management.metrics.export.statsd.port=8125
+management.metrics.export.statsd.flavor=etsy
+management.metrics.export.statsd.step=1m
+management.metrics.export.statsd.prefix=csye6225
+
+# CloudWatch Metrics enabled
+management.metrics.export.cloudwatch.enabled=true
+management.metrics.export.cloudwatch.namespace=WebApp
+management.metrics.export.cloudwatch.step=1m
+
+# Logging Configuration
+logging.file.name=/var/log/webapp/application.log
+logging.level.root=INFO
+logging.level.edu.csye6225.neu.webapp=DEBUG
+logging.pattern.console=%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n
+logging.pattern.file=%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n
+
+# Security settings
+server.servlet.session.cookie.http-only=true
+server.servlet.session.cookie.secure=true
+EOF
+
+# Set proper ownership and permissions
+sudo chown csye6225:csye6225 /opt/webapp/application.properties
+sudo chmod 640 /opt/webapp/application.properties
+
+echo "Contents of application.properties:"
+cat /opt/webapp/application.properties
+
+echo "=========================================================="
+echo "Setting up CloudWatch Agent..."
+echo "=========================================================="
+
+# Ensure CloudWatch agent directories exist
+sudo mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+sudo mkdir -p /var/log/amazon-cloudwatch-agent
+
+# Make sure log files exist with proper permissions
+sudo touch /var/log/amazon-cloudwatch-agent/amazon-cloudwatch-agent.log
+sudo chmod 644 /var/log/amazon-cloudwatch-agent/amazon-cloudwatch-agent.log
+
+# Create CloudWatch agent config file - using double quotes to allow variable substitution
+cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << EOF
+{
+  "agent": {
+    "metrics_collection_interval": 60,
+    "run_as_user": "root",
+    "debug": true,
+    "region": "${AWS_REGION}"
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/webapp/application.log",
+            "log_group_name": "${log_group_name}",
+            "log_stream_name": "application-{instance_id}",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/var/log/cloud-init-output.log",
+            "log_group_name": "${log_group_name}",
+            "log_stream_name": "cloud-init-{instance_id}",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/var/log/amazon-cloudwatch-agent/amazon-cloudwatch-agent.log",
+            "log_group_name": "${log_group_name}",
+            "log_stream_name": "cloudwatch-agent-{instance_id}",
+            "timezone": "UTC"
+          }
+        ]
+      }
+    },
+    "force_flush_interval": 15
+  },
+  "metrics": {
+    "namespace": "CSYE6225-WebApp",
+    "metrics_collected": {
+      "statsd": {
+        "service_address": "localhost:8125",
+        "metrics_collection_interval": 15,
+        "metrics_aggregation_interval": 60
+      },
+      "cpu": {
+        "resources": ["*"],
+        "measurement": [
+          "usage_active",
+          "usage_system",
+          "usage_user"
+        ],
+        "totalcpu": true,
+        "metrics_collection_interval": 60
+      },
+      "mem": {
+        "measurement": [
+          "used_percent"
+        ],
+        "metrics_collection_interval": 60
+      },
+      "disk": {
+        "resources": ["/"],
+        "measurement": [
+          "used_percent"
+        ],
+        "metrics_collection_interval": 60
+      }
+    }
+  }
+}
+EOF
+
+echo "Contents of CloudWatch agent config:"
+cat /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
+# Check CloudWatch agent installation
+echo "CloudWatch agent binary path:"
+ls -la /opt/aws/amazon-cloudwatch-agent/bin/ || echo "CloudWatch agent binaries not found!"
+
+# Start CloudWatch agent
+echo "Starting CloudWatch agent..."
+sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
+# Enable the service to start on boot
+sudo systemctl enable amazon-cloudwatch-agent
+
+# Restart the agent to apply new configuration
+sudo systemctl restart amazon-cloudwatch-agent
+
+# Check CloudWatch agent status
+echo "CloudWatch agent service status:"
+systemctl status amazon-cloudwatch-agent --no-pager || true
+
+# Check for CloudWatch agent logs
+echo "CloudWatch agent logs:"
+tail -n 50 /var/log/amazon-cloudwatch-agent/amazon-cloudwatch-agent.log || echo "No CloudWatch agent logs found!"
+
+# Restart web application to apply new environment variables
+echo "Restarting web application..."
+sudo systemctl restart webapp
+
+# Check webapp service status
+echo "Webapp service status:"
+systemctl status webapp --no-pager || true
+
+# Log completion for debugging
+echo "$(date '+%Y-%m-%d %H:%M:%S') [user-data] INFO - User data script completed successfully" >> /var/log/webapp/application.log
+
+echo "=========================================================="
+echo "CONFIGURATION COMPLETE: $(date)"
+echo "=========================================================="

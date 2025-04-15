@@ -1,0 +1,67 @@
+name: Packer Validate
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  packer-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Build Packages with Maven
+        run: mvn -B package -DskipTests
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Create artifacts directory and copy JAR
+        run: |
+          mkdir -p infrastructure/packer/artifacts
+          cp ./target/*.jar infrastructure/packer/artifacts/webapp-0.0.1-SNAPSHOT.jar
+
+      - name: Install Packer
+        run: |
+          wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt update && sudo apt install packer
+
+      - name: Run packer init and format
+        working-directory: infrastructure/packer/
+        run: |
+          packer init .
+          packer fmt -check .
+
+      - name: Run packer validate
+        working-directory: infrastructure/packer/
+        run: |
+          packer validate \
+            -var 'ami_name=${{ vars.AMI_NAME }}' \
+            -var 'aws_region=${{ vars.AWS_REGION }}' \
+            -var 'aws_instance_type=${{ vars.AWS_INSTANCE_TYPE }}' \
+            -var 'aws_source_ami_owner=${{ vars.AWS_SOURCE_AMI_OWNER }}' \
+            -var 'aws_source_ami_filter_name=${{ vars.AWS_SOURCE_AMI_FILTER_NAME }}' \
+            -var 'ssh_username=${{ vars.SSH_USERNAME }}' \
+            -var 'app_user=${{ vars.APP_USER }}' \
+            -var 'app_group=${{ vars.APP_GROUP }}' \
+            -var 'app_dir=${{ vars.APP_DIR }}' \
+            -var 'db_name=${{ vars.DB_NAME }}' \
+            -var 'db_user=${{ secrets.DB_USERNAME }}' \
+            -var 'db_password=${{ secrets.DB_PASSWORD }}' \
+            -var 's3_bucket_name=${{ vars.S3_BUCKET_NAME }}' \
+            -var 'app_binary=artifacts/webapp-0.0.1-SNAPSHOT.jar' \
+            -var 'webapp_service=${{ vars.WEBAPP_SERVICE }}' \
+            .

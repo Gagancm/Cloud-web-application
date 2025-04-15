@@ -1,0 +1,384 @@
+name: Packer Build and Deploy
+
+on:
+  push:
+    branches:
+      main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - demo
+
+env:
+  USE_DEV: ${{ github.event.inputs.environment == 'dev' || github.event.inputs.environment == null }}
+  USE_DEMO: ${{ github.event.inputs.environment == 'demo' }}
+
+jobs:
+  packer-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Run Unit Tests
+        run: mvn -B test
+
+      - name: Build Packages with Maven
+        run: mvn -B package -DskipTests
+
+      - name: Configure AWS Credentials for Build
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Create artifacts directory and copy JAR
+        run: |
+          mkdir -p infrastructure/packer/artifacts
+          cp ./target/*.jar infrastructure/packer/artifacts/webapp-0.0.1-SNAPSHOT.jar
+
+      - name: Install Packer
+        run: |
+          wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt update && sudo apt install packer
+
+      - name: Run packer init and format
+        working-directory: infrastructure/packer/
+        env:
+          PACKER_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          packer init .
+          packer fmt .
+
+      - name: Run packer build and capture AMI ID
+        working-directory: infrastructure/packer/
+        env:
+          PACKER_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        id: packer_build
+        run: |
+          # Run packer build and save the output to a file
+          packer build \
+            -var 'ami_name=${{ vars.AMI_NAME }}' \
+            -var 'aws_region=${{ vars.AWS_REGION }}' \
+            -var 'aws_instance_type=${{ vars.AWS_INSTANCE_TYPE }}' \
+            -var 'aws_source_ami_owner=${{ vars.AWS_SOURCE_AMI_OWNER }}' \
+            -var 'aws_source_ami_filter_name=${{ vars.AWS_SOURCE_AMI_FILTER_NAME }}' \
+            -var 'ssh_username=${{ vars.SSH_USERNAME }}' \
+            -var 'app_user=${{ vars.APP_USER }}' \
+            -var 'app_group=${{ vars.APP_GROUP }}' \
+            -var 'app_dir=${{ vars.APP_DIR }}' \
+            -var 'db_name=${{ vars.DB_NAME }}' \
+            -var 'db_user=${{ secrets.DB_USERNAME }}' \
+            -var 'db_password=${{ secrets.DB_PASSWORD }}' \
+            -var 's3_bucket_name=${{ vars.S3_BUCKET_NAME }}' \
+            -var 'app_binary=artifacts/webapp-0.0.1-SNAPSHOT.jar' \
+            -var 'webapp_service=${{ vars.WEBAPP_SERVICE }}' \
+            . | tee packer_output.txt
+          
+          # Extract AMI ID
+          AMI_ID=$(grep -oP 'amazon-ebs\.custom-image: AMI: \K[a-z0-9-]+' packer_output.txt || echo "")
+          
+          if [ -n "$AMI_ID" ]; then
+            echo "Extracted AMI ID: $AMI_ID"
+            echo "ami_id=$AMI_ID" >> $GITHUB_OUTPUT
+            echo "AMI_ID=$AMI_ID" >> $GITHUB_ENV
+          else
+            echo "Failed to extract AMI ID from Packer output"
+            cat packer_output.txt
+            exit 1
+          fi
+
+      - name: Share AMI with DEMO account
+        if: env.USE_DEV == 'true' || env.USE_DEMO == 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          DEMO_ACCOUNT_ID: ${{ vars.DEMO_ACCOUNT_ID }}
+        run: |
+          # Ensure AWS CLI is available
+          aws --version
+          
+          echo "Sharing AMI $AMI_ID with account $DEMO_ACCOUNT_ID"
+          
+          # Share the AMI with the DEMO account
+          aws ec2 modify-image-attribute \
+            --image-id $AMI_ID \
+            --launch-permission "Add=[{UserId=$DEMO_ACCOUNT_ID}]" \
+            --region $AWS_REGION
+          
+          # Verify sharing was successful
+          PERMISSIONS=$(aws ec2 describe-image-attribute \
+            --image-id $AMI_ID \
+            --attribute launchPermission \
+            --region $AWS_REGION)
+          
+          echo "Current launch permissions: $PERMISSIONS"
+          
+          echo "AMI sharing completed successfully"
+          
+      # Update DEV environment if selected
+      - if: env.USE_DEV == 'true'
+        name: Update Launch Template in DEV
+        run: |
+          echo "Fetching latest launch template from DEV..."
+          # List all launch templates and get the first one
+          LATEST_LAUNCH_TEMPLATE=$(aws ec2 describe-launch-templates \
+            --query 'LaunchTemplates[0].LaunchTemplateId' \
+            --output text)
+          
+          # Then get the launch template name using the ID
+          LAUNCH_TEMPLATE_NAME=$(aws ec2 describe-launch-templates \
+            --launch-template-ids "$LATEST_LAUNCH_TEMPLATE" \
+            --query 'LaunchTemplates[0].LaunchTemplateName' \
+            --output text)
+          
+          echo "LAUNCH_TEMPLATE_NAME: $LAUNCH_TEMPLATE_NAME"
+          echo "LATEST_LAUNCH_TEMPLATE: $LATEST_LAUNCH_TEMPLATE"
+ 
+          echo "Updating launch template with new AMI ID..."
+          NEW_VERSION=$(aws ec2 create-launch-template-version \
+            --launch-template-id $LATEST_LAUNCH_TEMPLATE \
+            --source-version '$Latest' \
+            --launch-template-data '{"ImageId":"'$AMI_ID'"}' \
+            --query 'LaunchTemplateVersion.VersionNumber' \
+            --output text)
+ 
+          echo "Launch template updated with new AMI ID, version: $NEW_VERSION"
+            
+          echo "Updating Auto Scaling Group with new launch template..."
+          AUTO_SCALING_GROUP=$(aws autoscaling describe-auto-scaling-groups \
+            --query 'AutoScalingGroups[0].AutoScalingGroupName' \
+            --output text)
+ 
+          echo "Auto Scaling Group: $AUTO_SCALING_GROUP"
+ 
+          # Update ASG using the ID instead of name since we have it
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name $AUTO_SCALING_GROUP \
+            --launch-template "LaunchTemplateId=$LATEST_LAUNCH_TEMPLATE,Version=\$Latest"
+          
+          echo "Auto Scaling Group updated successfully"
+          echo "asg_name=$AUTO_SCALING_GROUP" >> $GITHUB_OUTPUT
+ 
+      - if: env.USE_DEV == 'true'
+        name: Start Instance Refresh in DEV
+        id: start_refresh_dev
+        run: |
+          echo "Starting instance refresh in DEV..."
+          AUTO_SCALING_GROUP=$(aws autoscaling describe-auto-scaling-groups \
+            --query 'AutoScalingGroups[0].AutoScalingGroupName' \
+            --output text)
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name $AUTO_SCALING_GROUP \
+            --preferences '{"MinHealthyPercentage": 90, "InstanceWarmup": 60}' \
+            --query 'InstanceRefreshId' \
+            --output text)
+          echo "Instance Refresh ID: $REFRESH_ID"
+          echo "REFRESH_ID=$REFRESH_ID" >> $GITHUB_ENV
+          echo "refresh_id=$REFRESH_ID" >> $GITHUB_OUTPUT
+ 
+      - if: env.USE_DEV == 'true'
+        name: Wait for Instance Refresh Completion in DEV
+        run: |
+          echo "Waiting for instance refresh to complete in DEV..."
+          AUTO_SCALING_GROUP=$(aws autoscaling describe-auto-scaling-groups \
+            --query 'AutoScalingGroups[0].AutoScalingGroupName' \
+            --output text)
+          
+          start_time=$(date +%s)
+          
+          while true; do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name $AUTO_SCALING_GROUP \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --query "InstanceRefreshes[0].Status" \
+              --output text)
+              
+            current_time=$(date +%s)
+            elapsed_time=$((current_time - start_time))
+            elapsed_minutes=$((elapsed_time / 60))
+            
+            echo "Current status: $STATUS (running for ${elapsed_minutes} minutes)"
+            
+            if [ "$STATUS" == "Successful" ]; then
+              echo "Instance refresh completed successfully!"
+              break
+            elif [ "$STATUS" == "Failed" ] || [ "$STATUS" == "Cancelled" ]; then
+              FAILED_DETAILS=$(aws autoscaling describe-instance-refreshes \
+                --auto-scaling-group-name $AUTO_SCALING_GROUP \
+                --instance-refresh-ids "$REFRESH_ID" \
+                --query 'InstanceRefreshes[0]' \
+                --output json)
+                
+              echo "Instance refresh failed or was cancelled:"
+              echo "$FAILED_DETAILS"
+              exit 1
+            elif [ "$STATUS" == "Pending" ] || [ "$STATUS" == "InProgress" ]; then
+              echo "Refresh still in progress, waiting 30 seconds..."
+              sleep 30
+            else
+              echo "Unknown status: $STATUS, waiting 30 seconds..."
+              sleep 30
+            fi
+          done
+          
+          echo "DEV deployment completed successfully!"
+      
+      # Update DEMO environment if selected
+      - if: env.USE_DEMO == 'true'
+        name: Configure AWS credentials for DEMO
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.DEMO_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.DEMO_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+      
+      - if: env.USE_DEMO == 'true'
+        name: Wait for AMI to be available in DEMO account
+        run: |
+          echo "Waiting for AMI to be available in DEMO account..."
+          
+          # Poll until AMI is available in DEMO account
+          MAX_ATTEMPTS=30
+          ATTEMPT=0
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT+1))
+            echo "Checking AMI availability (attempt $ATTEMPT/$MAX_ATTEMPTS)..."
+            
+            AMI_STATUS=$(aws ec2 describe-images --image-ids "$AMI_ID" --query 'Images[0].State' --output text 2>/dev/null || echo "not_found")
+            
+            if [ "$AMI_STATUS" == "available" ]; then
+              echo "AMI is now available in DEMO account"
+              break
+            fi
+            
+            if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+              echo "Timeout waiting for AMI to be available in DEMO account"
+              exit 1
+            fi
+            
+            echo "AMI not yet available, waiting 10 seconds..."
+            sleep 10
+          done
+
+      - if: env.USE_DEMO == 'true'
+        name: Update Launch Template in DEMO
+        run: |
+          echo "Fetching latest launch template in DEMO..."
+          # List all launch templates and get the first one
+          LATEST_LAUNCH_TEMPLATE=$(aws ec2 describe-launch-templates \
+            --query 'LaunchTemplates[0].LaunchTemplateId' \
+            --output text)
+          
+          # Then get the launch template name using the ID
+          LAUNCH_TEMPLATE_NAME=$(aws ec2 describe-launch-templates \
+            --launch-template-ids "$LATEST_LAUNCH_TEMPLATE" \
+            --query 'LaunchTemplates[0].LaunchTemplateName' \
+            --output text)
+          
+          echo "LAUNCH_TEMPLATE_NAME: $LAUNCH_TEMPLATE_NAME"
+          echo "LATEST_LAUNCH_TEMPLATE: $LATEST_LAUNCH_TEMPLATE"
+ 
+          echo "Updating launch template with new AMI ID..."
+          NEW_VERSION=$(aws ec2 create-launch-template-version \
+            --launch-template-id $LATEST_LAUNCH_TEMPLATE \
+            --source-version '$Latest' \
+            --launch-template-data '{"ImageId":"'$AMI_ID'"}' \
+            --query 'LaunchTemplateVersion.VersionNumber' \
+            --output text)
+ 
+          echo "Launch template updated with new AMI ID in DEMO, version: $NEW_VERSION"
+            
+          echo "Updating Auto Scaling Group with new launch template..."
+          AUTO_SCALING_GROUP=$(aws autoscaling describe-auto-scaling-groups \
+            --query 'AutoScalingGroups[0].AutoScalingGroupName' \
+            --output text)
+ 
+          echo "Auto Scaling Group: $AUTO_SCALING_GROUP"
+ 
+          # Update ASG using the ID instead of name since we have it
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name $AUTO_SCALING_GROUP \
+            --launch-template "LaunchTemplateId=$LATEST_LAUNCH_TEMPLATE,Version=\$Latest"
+          
+          echo "Auto Scaling Group updated successfully"
+      
+      - if: env.USE_DEMO == 'true'
+        name: Start Instance Refresh in DEMO
+        id: start_refresh_demo
+        run: |
+          echo "Starting instance refresh in DEMO..."
+          AUTO_SCALING_GROUP=$(aws autoscaling describe-auto-scaling-groups \
+            --query 'AutoScalingGroups[0].AutoScalingGroupName' \
+            --output text)
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name $AUTO_SCALING_GROUP \
+            --preferences '{"MinHealthyPercentage": 90, "InstanceWarmup": 60}' \
+            --query 'InstanceRefreshId' \
+            --output text)
+          echo "Instance Refresh ID: $REFRESH_ID"
+          echo "REFRESH_ID=$REFRESH_ID" >> $GITHUB_ENV
+          echo "refresh_id=$REFRESH_ID" >> $GITHUB_OUTPUT
+      
+      - if: env.USE_DEMO == 'true'
+        name: Wait for Instance Refresh Completion in DEMO
+        run: |
+          echo "Waiting for instance refresh to complete in DEMO..."
+          AUTO_SCALING_GROUP=$(aws autoscaling describe-auto-scaling-groups \
+            --query 'AutoScalingGroups[0].AutoScalingGroupName' \
+            --output text)
+          
+          start_time=$(date +%s)
+          
+          while true; do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name $AUTO_SCALING_GROUP \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --query "InstanceRefreshes[0].Status" \
+              --output text)
+              
+            current_time=$(date +%s)
+            elapsed_time=$((current_time - start_time))
+            elapsed_minutes=$((elapsed_time / 60))
+            
+            echo "Current status: $STATUS (running for ${elapsed_minutes} minutes)"
+            
+            if [ "$STATUS" == "Successful" ]; then
+              echo "Instance refresh completed successfully!"
+              break
+            elif [ "$STATUS" == "Failed" ] || [ "$STATUS" == "Cancelled" ]; then
+              FAILED_DETAILS=$(aws autoscaling describe-instance-refreshes \
+                --auto-scaling-group-name $AUTO_SCALING_GROUP \
+                --instance-refresh-ids "$REFRESH_ID" \
+                --query 'InstanceRefreshes[0]' \
+                --output json)
+                
+              echo "Instance refresh failed or was cancelled:"
+              echo "$FAILED_DETAILS"
+              exit 1
+            elif [ "$STATUS" == "Pending" ] || [ "$STATUS" == "InProgress" ]; then
+              echo "Refresh still in progress, waiting 30 seconds..."
+              sleep 30
+            else
+              echo "Unknown status: $STATUS, waiting 30 seconds..."
+              sleep 30
+            fi
+          done
+          
+          echo "DEMO deployment completed successfully!"

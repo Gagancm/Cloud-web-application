@@ -1,0 +1,33 @@
+[Unit]
+Description=Spring Boot Web Application
+After=network.target
+
+[Service]
+User=csye6225
+Group=csye6225
+Type=simple
+Environment="SPRING_CONFIG_LOCATION=/opt/webapp/application.properties"
+
+# Database connection environment variables
+Environment="DB_URL=jdbc:postgresql://${DB_HOSTNAME}:5432/${DB_NAME}"
+Environment="DB_USERNAME=${DB_USERNAME}"
+Environment="DB_PASSWORD=${DB_PASSWORD}"
+Environment="DB_NAME=${DB_NAME}"
+Environment="DB_HOST=${DB_HOSTNAME}"
+Environment="DB_PORT=5432"
+
+# AWS environment variables
+Environment="AWS_REGION=${AWS_REGION}"
+Environment="S3_BUCKET_NAME=${S3_BUCKET_NAME}"
+
+WorkingDirectory=/opt/webapp
+ExecStart=/usr/bin/java -jar /opt/webapp/webapp-0.0.1-SNAPSHOT.jar
+StandardOutput=append:/var/log/webapp/application.log
+StandardError=append:/var/log/webapp/application.log
+SuccessExitStatus=143
+TimeoutStopSec=10
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
